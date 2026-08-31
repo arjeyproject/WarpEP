@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    name: single-file bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/build_bundle.py
+      - run: python -m pip install --upgrade build && python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle
+          path: |
+            warpep.pyz
+            dist/*
+
+  binaries:
+    name: binary for ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+            artifact: warpep-linux-x86_64
+          - os: windows-latest
+            label: windows-x86_64
+            artifact: warpep-windows-x86_64.exe
+          - os: macos-latest
+            label: macos-arm64
+            artifact: warpep-macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pyinstaller
+      - name: Build standalone binary
+        run: pyinstaller --onefile --name warpep --console scripts/entrypoint.py
+      - name: Rename artifact
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            mv dist/warpep.exe "dist/${{ matrix.artifact }}"
+          else
+            mv dist/warpep "dist/${{ matrix.artifact }}"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+
+  publish:
+    name: attach to release
+    needs: [bundle, binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -lh release
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
