@@ -1,12 +1,13 @@
 """Real Cloudflare WARP registration.
 
-A handshake probe works with any keypair, but a tunnel that actually *carries*
-traffic needs a registered WARP peer. This module talks to the same public
-registration API the official client uses, with the standard library only, and
-caches the result under the user's config directory so you register once.
+A handshake probe works with any *enrolled* keypair, but a tunnel that actually
+carries your traffic needs a registration of your own. This module talks to the
+same public registration API the official client uses, with the standard library
+only, and caches the result under the user's config directory so you register
+once.
 
-Nothing here is scraped or reverse-engineered beyond what wgcf, warp-plus and
-every other WARP tool already document publicly.
+Nothing here is scraped or reverse-engineered beyond what wgcf, warp-plus, usque
+and every other WARP tool already document publicly.
 """
 
 from __future__ import annotations
@@ -23,7 +24,10 @@ from typing import Any, Dict, Optional
 from .version import user_agent
 from .wireguard.noise import Keypair
 
-__all__ = ["WarpAccount", "AccountError", "register", "load_account", "save_account", "ensure_account", "config_dir"]
+__all__ = [
+    "WarpAccount", "AccountError", "register", "load_account", "save_account",
+    "ensure_account", "config_dir", "account_path",
+]
 
 API_BASE = "https://api.cloudflareclient.com/v0a2158"
 CLIENT_VERSION = "a-6.30-3596"
@@ -132,7 +136,6 @@ def register(keypair: Optional[Keypair] = None, timeout: float = 15.0) -> WarpAc
         try:
             _post(f"/reg/{account.account_id}", {"warp_enabled": True}, token=account.token, method="PATCH", timeout=timeout)
         except AccountError:
-            # WARP stays usable without the toggle; never fail registration on it.
             pass
     return account
 

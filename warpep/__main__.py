@@ -1,4 +1,4 @@
-"""Allow ``python -m warpep`` everywhere, including Termux and plain Windows."""
+"""Entry point for ``python -m warpep``."""
 
 import sys
 
