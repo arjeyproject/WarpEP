@@ -1,8 +1,8 @@
 """Cloudflare WARP endpoint address space.
 
 These are Cloudflare's publicly documented anycast prefixes and UDP ports for the
-WARP (WireGuard) service. WarpEP never guesses at random internet hosts: the
-search space is exactly the address space Cloudflare publishes for this service.
+WARP service. WarpEP never guesses at random internet hosts: the search space is
+exactly the address space Cloudflare publishes for WARP and for MASQUE.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ __all__ = [
     "parse_ports",
     "sample_addresses",
     "build_endpoints",
+    "spread",
 ]
 
 # Cloudflare WARP IPv4 anycast prefixes.
@@ -37,8 +38,7 @@ IPV4_PREFIXES: Tuple[str, ...] = (
     "188.114.99.0/24",
 )
 
-# Cloudflare WARP IPv6 anycast prefixes. Only the low 32 bits are ever varied:
-# the service is reachable on ::a29f:xxxx / ::bc72:xxxx style suffixes.
+# Cloudflare WARP IPv6 anycast prefixes.
 IPV6_PREFIXES: Tuple[str, ...] = (
     "2606:4700:d0::/64",
     "2606:4700:d1::/64",
@@ -72,6 +72,13 @@ class Endpoint:
     @property
     def is_ipv6(self) -> bool:
         return ":" in self.address
+
+    @property
+    def prefix24(self) -> str:
+        """The /24 (or /64-ish block) this endpoint belongs to, for grouping."""
+        if self.is_ipv6:
+            return ":".join(self.address.split(":")[:4]) + "::/64"
+        return self.address.rsplit(".", 1)[0] + ".0/24"
 
     def __str__(self) -> str:
         return f"[{self.address}]:{self.port}" if self.is_ipv6 else f"{self.address}:{self.port}"
@@ -155,6 +162,9 @@ def expand_prefixes(prefixes: Sequence[str]) -> List[str]:
             continue
         if network.num_addresses > 65536:
             raise ValueError(f"prefix {prefix} is too large to enumerate")
+        if network.num_addresses == 1:
+            addresses.append(str(network.network_address))
+            continue
         addresses.extend(str(host) for host in network.hosts())
     seen = set()
     unique = []
@@ -169,6 +179,41 @@ def sample_addresses(addresses: Sequence[str], count: int, rng: Optional[random.
     if count <= 0 or count >= len(addresses):
         return list(addresses)
     return (rng or random).sample(list(addresses), count)
+
+
+def spread(addresses: Sequence[str], count: int, rng: Optional[random.Random] = None) -> List[str]:
+    """Sample evenly across prefixes instead of uniformly across the whole space.
+
+    A plain random sample of a /24-heavy space clusters: with seven prefixes and
+    48 slots you can easily draw 20 addresses from one block and 2 from another,
+    which is exactly how a scan ends up reporting that "nothing works" when only
+    one block is being blackholed. Round-robin over the blocks fixes that.
+    """
+    if count <= 0 or count >= len(addresses):
+        return list(addresses)
+    buckets: dict = {}
+    for address in addresses:
+        key = address.rsplit(".", 1)[0] if "." in address else ":".join(address.split(":")[:4])
+        buckets.setdefault(key, []).append(address)
+    picker = rng or random
+    for pool in buckets.values():
+        picker.shuffle(pool)
+    ordered: List[str] = []
+    keys = sorted(buckets)
+    index = 0
+    while len(ordered) < count:
+        progressed = False
+        for key in keys:
+            pool = buckets[key]
+            if index < len(pool):
+                ordered.append(pool[index])
+                progressed = True
+                if len(ordered) >= count:
+                    break
+        if not progressed:
+            break
+        index += 1
+    return ordered
 
 
 def build_endpoints(addresses: Sequence[str], ports: Sequence[int]) -> List[Endpoint]:
