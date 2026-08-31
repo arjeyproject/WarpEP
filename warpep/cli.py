@@ -1,19 +1,21 @@
 """WarpEP command line interface.
 
-    warpep                    scan and rank Cloudflare WARP endpoints
-    warpep scan --fast        quick scan, good enough for a phone on 4G
-    warpep scan --deep        sweep every published prefix, all ports
-    warpep verify IP:PORT     prove an endpoint actually carries traffic
-    warpep config             generate a WireGuard config for the best endpoint
-    warpep register           create a real WARP registration (cached locally)
-    warpep selftest           verify the crypto and scan loop on this machine
+    warpep                     open the interactive panel (or scan when piped)
+    warpep panel               the panel, explicitly
+    warpep scan --fast         quick scan, good enough for a phone on 4G
+    warpep scan --deep         sweep every published prefix, all ports
+    warpep masque              probe MASQUE, for when WireGuard UDP is blocked
+    warpep verify IP:PORT      prove an endpoint actually carries traffic
+    warpep config -o warp.conf generate a config for the best endpoint
+    warpep doctor              find out what is really broken on this network
+    warpep register            create a real WARP registration (cached locally)
+    warpep operators           what has worked on the networks you have used
+    warpep selftest            verify the crypto and scan loop on this machine
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
-import os
 import random
 import sys
 import time
@@ -21,7 +23,8 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 from . import account as account_mod
-from . import exporters, selftest
+from . import doctor as doctor_mod
+from . import exporters, masque, operator as operator_mod, selftest
 from .endpoints import (
     ALL_PORTS,
     Endpoint,
@@ -30,24 +33,39 @@ from .endpoints import (
     expand_prefixes,
     parse_ports,
     parse_prefixes,
-    sample_addresses,
+    spread,
 )
 from .engine import (
     EndpointResult,
     ScanConfig,
+    ScanReport,
     Scanner,
-    WARP_PUBLIC_KEY_B64,
     verify_endpoint,
-    warp_public_key,
 )
+from .identity import (
+    WARP_RESPONDER_PUBLIC_KEY_B64,
+    IdentityError,
+    ScanIdentity,
+    decode_public_key,
+    resolve as resolve_identity,
+)
+from .obfuscation import ObfuscationError, ObfuscationProfile, awg_profile, off as no_obfuscation
 from .output import Console, Progress
 from .version import BRAND, REPO, TAGLINE, __version__
-from .wireguard.noise import Keypair
 
 EXIT_OK = 0
 EXIT_NOTHING_FOUND = 1
 EXIT_USAGE = 2
 EXIT_INTERRUPTED = 130
+
+COMMANDS = (
+    "panel", "scan", "masque", "verify", "config", "register",
+    "operators", "doctor", "selftest", "version",
+)
+_GLOBAL_FLAGS = {"--no-color", "-q", "--quiet"}
+
+
+# -- parser ----------------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,23 +80,45 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-q", "--quiet", action="store_true", help="only print the final result")
     sub = parser.add_subparsers(dest="command")
 
+    sub.add_parser("panel", help="open the interactive panel")
+
     scan = sub.add_parser("scan", help="scan and rank WARP endpoints")
     _add_scan_flags(scan)
+
+    masque_cmd = sub.add_parser("masque", help="probe Cloudflare's MASQUE transport")
+    masque_cmd.add_argument(
+        "--transport",
+        choices=["masque-h2", "masque-h3", "both"],
+        default="masque-h2",
+        help="h2 = CONNECT-IP over TCP/TLS (survives UDP blocking), h3 = over QUIC",
+    )
+    masque_cmd.add_argument("-6", "--ipv6", action="store_true", help="probe the IPv6 MASQUE pools")
+    masque_cmd.add_argument("-p", "--ports", action="append", help="ports to probe (default: the published MASQUE set)")
+    masque_cmd.add_argument("--sni", default=masque.MASQUE_SNI, help="SNI to present (default: the WARP client's)")
+    masque_cmd.add_argument("--timeout", type=float, default=4.0, help="per-attempt timeout in seconds")
+    masque_cmd.add_argument("--attempts", type=int, default=2, help="attempts per endpoint (default 2)")
+    masque_cmd.add_argument("--workers", type=int, default=64, help="concurrent probes (default 64)")
+    masque_cmd.add_argument("-n", "--sample", type=int, default=256, help="addresses to probe, 0 = all")
+    masque_cmd.add_argument("-t", "--top", type=int, default=10, help="rows to show")
+    masque_cmd.add_argument("--json", help="write full results as JSON")
+    masque_cmd.add_argument("-o", "--out", help="write the winners as ip:port lines")
 
     verify = sub.add_parser("verify", help="push real traffic through an endpoint")
     verify.add_argument("endpoint", help="endpoint to verify, e.g. 162.159.192.1:2408")
     verify.add_argument("--echoes", type=int, default=3, help="ICMP echoes to send through the tunnel (default 3)")
     verify.add_argument("--timeout", type=float, default=2.5, help="per-step timeout in seconds")
-    verify.add_argument("--peer-key", default=WARP_PUBLIC_KEY_B64, help="responder public key (default: Cloudflare WARP)")
+    verify.add_argument("--peer-key", default=WARP_RESPONDER_PUBLIC_KEY_B64, help="responder public key")
+    verify.add_argument("--key", help="WARP private key to probe with (base64)")
     verify.add_argument("--target", default="162.159.192.1", help="IP to ping inside the tunnel")
+    verify.add_argument("--awg", action="store_true", help="wrap the handshake in AmneziaWG obfuscation")
 
     config = sub.add_parser("config", help="generate a client config for the best endpoint")
     config.add_argument("endpoint", nargs="?", help="endpoint to use; omit to scan for the best one")
     config.add_argument(
         "--format",
-        choices=["wireguard", "singbox", "endpoint"],
+        choices=list(exporters.FORMATS),
         default="wireguard",
-        help="output format (default wireguard)",
+        help="output format (default wireguard; amneziawg adds the junk parameters)",
     )
     config.add_argument("-o", "--out", help="write to a file instead of stdout")
     config.add_argument("--mtu", type=int, default=1280, help="interface MTU (default 1280)")
@@ -89,6 +129,11 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("--refresh", action="store_true", help="force a new registration")
     register.add_argument("--timeout", type=float, default=15.0, help="API timeout in seconds")
 
+    operators = sub.add_parser("operators", help="what has worked on the networks you have used")
+    operators.add_argument("--forget", action="store_true", help="delete the memory for the current network")
+    operators.add_argument("--json", action="store_true", help="print the memory as JSON")
+
+    sub.add_parser("doctor", help="diagnose this network in plain words")
     sub.add_parser("selftest", help="verify crypto vectors and the scan loop locally")
     sub.add_parser("version", help="print version information")
     return parser
@@ -97,58 +142,54 @@ def build_parser() -> argparse.ArgumentParser:
 def _add_scan_flags(parser: argparse.ArgumentParser, minimal: bool = False) -> None:
     parser.add_argument("-6", "--ipv6", action="store_true", help="scan the IPv6 WARP prefixes")
     parser.add_argument("-n", "--sample", type=int, default=None, help="how many addresses to sample (0 = every address)")
-    parser.add_argument("-c", "--probes", type=int, default=None, help="handshakes per endpoint (default 3)")
+    parser.add_argument("-c", "--probes", type=int, default=None, help="handshakes per endpoint (default 4)")
     parser.add_argument("-p", "--ports", action="append", help="ports: list, range, 'primary' or 'all'")
     parser.add_argument("--prefix", action="append", help="override the prefixes to scan (CIDR)")
     parser.add_argument("--target", action="append", help="scan only these endpoints (repeatable)")
     parser.add_argument("--timeout", type=float, default=None, help="reply timeout in seconds (default 1.2)")
-    parser.add_argument("--rate", type=int, default=1500, help="probes per second (default 1500)")
-    parser.add_argument("--max-inflight", type=int, default=512, help="outstanding probes (default 512)")
+    parser.add_argument("--rate", type=int, default=700, help="probes per second (default 700)")
+    parser.add_argument("--max-inflight", type=int, default=384, help="outstanding probes (default 384)")
+    parser.add_argument("--budget", type=float, default=0.0, help="give up after this many seconds (0 = no limit)")
     parser.add_argument("--source-ip", help="bind probes to a specific local address")
-    parser.add_argument("--peer-key", default=WARP_PUBLIC_KEY_B64, help="responder public key (default: Cloudflare WARP)")
+    parser.add_argument("--peer-key", default=WARP_RESPONDER_PUBLIC_KEY_B64, help="responder public key")
+    parser.add_argument("--key", help="WARP private key to probe with (base64); must be an enrolled device")
+    parser.add_argument("--unregistered", action="store_true",
+                        help="allow a throwaway key; Cloudflare will ignore it and every endpoint will look dead")
     parser.add_argument("--seed", type=int, help="seed the address sampler for reproducible scans")
     parser.add_argument("--fast", action="store_true", help="preset: fewer addresses, port 2408 only")
     parser.add_argument("--deep", action="store_true", help="preset: every address, more probes, all ports")
     parser.add_argument("--skip-port-scan", action="store_true", help="trust the given ports, skip discovery")
+    parser.add_argument("--no-preflight", action="store_true", help="skip the control-endpoint sanity check")
+    parser.add_argument("--awg", action="store_true", help="force AmneziaWG obfuscation on every probe")
+    parser.add_argument("--no-awg", action="store_true", help="never obfuscate, not even when confirming survivors")
+    parser.add_argument("--awg-jc", type=int, help="AmneziaWG junk packet count")
+    parser.add_argument("--awg-jmin", type=int, help="AmneziaWG minimum junk packet size")
+    parser.add_argument("--awg-jmax", type=int, help="AmneziaWG maximum junk packet size")
+    parser.add_argument("--i1", help="AmneziaWG magic packet spec, or 'none'")
+    parser.add_argument("--no-operator", action="store_true", help="skip ISP detection and per-operator memory")
     if minimal:
         return
     parser.add_argument("-t", "--top", type=int, default=10, help="how many results to show (default 10)")
-    parser.add_argument("--verify", nargs="?", type=int, const=1, default=0, help="deep-verify the best N endpoints")
-    parser.add_argument("--json", help="write full results as JSON")
+    parser.add_argument("--verify", nargs="?", type=int, const=3, default=None,
+                        help="tunnel-verify the best N endpoints (default 3, 0 to disable)")
+    parser.add_argument("--json", help="write the full report as JSON")
     parser.add_argument("--csv", help="write full results as CSV")
-    parser.add_argument("-o", "--out", help="write the winning endpoints as plain ip:port lines")
+    parser.add_argument("-o", "--out", help="write the healthy endpoints as plain ip:port lines")
+    parser.add_argument("--links", help="write warp:// links for Hiddify / NekoBox")
     parser.add_argument("--conf", help="write a WireGuard config for the best endpoint")
+    parser.add_argument("--awg-conf", help="write an AmneziaWG config for the best endpoint")
     parser.add_argument("--singbox", help="write a sing-box / Hiddify outbound for the best endpoint")
 
 
-def _decode_key(value: str) -> bytes:
-    try:
-        raw = base64.b64decode(value + "=" * (-len(value) % 4))
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"invalid base64 public key: {value!r}") from exc
-    if len(raw) != 32:
-        raise ValueError("public key must decode to 32 bytes")
-    return raw
-
-
-def _static_key(console: Console, allow_cached: bool = True) -> Keypair:
-    """Scan with the cached WARP identity when we have one, else a fresh key."""
-    if allow_cached:
-        cached = account_mod.load_account()
-        if cached:
-            try:
-                return cached.keypair
-            except Exception:  # noqa: BLE001
-                console.warn("cached WARP account is unreadable, using a throwaway key")
-    return Keypair.generate()
+# -- shared plumbing --------------------------------------------------------
 
 
 def _apply_presets(args: argparse.Namespace) -> None:
     if getattr(args, "fast", False) and getattr(args, "deep", False):
         raise ValueError("--fast and --deep are mutually exclusive")
     if getattr(args, "fast", False):
-        args.sample = 48 if args.sample is None else args.sample
-        args.probes = 2 if args.probes is None else args.probes
+        args.sample = 64 if args.sample is None else args.sample
+        args.probes = 3 if args.probes is None else args.probes
         args.timeout = 1.0 if args.timeout is None else args.timeout
         args.ports = args.ports or ["2408"]
         args.skip_port_scan = True
@@ -158,11 +199,67 @@ def _apply_presets(args: argparse.Namespace) -> None:
         args.timeout = 1.5 if args.timeout is None else args.timeout
         args.ports = args.ports or ["all"]
     args.sample = 128 if args.sample is None else args.sample
-    args.probes = 3 if args.probes is None else args.probes
+    args.probes = 4 if args.probes is None else args.probes
     args.timeout = 1.2 if args.timeout is None else args.timeout
 
 
-def _collect_targets(console: Console, args: argparse.Namespace, scanner: Scanner) -> List[Endpoint]:
+def _obfuscation(args: argparse.Namespace) -> ObfuscationProfile:
+    if getattr(args, "no_awg", False):
+        return no_obfuscation()
+    wants = getattr(args, "awg", False) or any(
+        getattr(args, name, None) is not None for name in ("awg_jc", "awg_jmin", "awg_jmax", "i1")
+    )
+    if not wants:
+        return no_obfuscation()
+    return awg_profile(
+        junk_count=getattr(args, "awg_jc", None),
+        junk_min=getattr(args, "awg_jmin", None),
+        junk_max=getattr(args, "awg_jmax", None),
+        magic=getattr(args, "i1", None),
+    )
+
+
+def _identity(args: argparse.Namespace, console: Console) -> ScanIdentity:
+    identity = resolve_identity(
+        private_key=getattr(args, "key", None),
+        peer_key=getattr(args, "peer_key", None) if getattr(args, "peer_key", "") != WARP_RESPONDER_PUBLIC_KEY_B64 else None,
+        allow_unregistered=getattr(args, "unregistered", False),
+        use_bundled=not getattr(args, "unregistered", False),
+    )
+    console.identity_card(identity)
+    return identity
+
+
+def _network(args: argparse.Namespace, console: Console) -> Optional[operator_mod.NetworkProfile]:
+    if getattr(args, "no_operator", False):
+        return None
+    profile = operator_mod.detect()
+    console.network_card(profile)
+    return profile
+
+
+def _scan_config(args: argparse.Namespace, obfuscation: ObfuscationProfile) -> ScanConfig:
+    verify = getattr(args, "verify", None)
+    return ScanConfig(
+        probes=args.probes,
+        timeout=args.timeout,
+        rate=args.rate,
+        max_inflight=args.max_inflight,
+        source_ip=args.source_ip,
+        ipv6=args.ipv6,
+        obfuscation=obfuscation,
+        confirm_probes=args.probes,
+        verify_top=3 if verify is None else verify,
+        budget=getattr(args, "budget", 0.0) or 0.0,
+    )
+
+
+def _collect_targets(
+    console: Console,
+    args: argparse.Namespace,
+    scanner: Scanner,
+    profile: Optional[operator_mod.NetworkProfile],
+) -> List[Endpoint]:
     if args.target:
         targets = []
         for value in args.target:
@@ -175,7 +272,7 @@ def _collect_targets(console: Console, args: argparse.Namespace, scanner: Scanne
     ports = parse_ports(args.ports)
     addresses = expand_prefixes(prefixes)
     rng = random.Random(args.seed) if args.seed is not None else random
-    sampled = sample_addresses(addresses, args.sample, rng)
+    sampled = spread(addresses, args.sample, rng)
 
     console.info(
         f"address space: {len(addresses)} addresses in {len(prefixes)} "
@@ -183,11 +280,10 @@ def _collect_targets(console: Console, args: argparse.Namespace, scanner: Scanne
     )
 
     if not args.skip_port_scan and len(ports) > 1:
-        discovery_ports = ports
-        found = scanner.discover_ports(sampled, discovery_ports, sample=6)
-        if not found and set(discovery_ports) != set(ALL_PORTS):
+        found = scanner.discover_ports(sampled, ports, sample=12)
+        if not found and set(ports) != set(ALL_PORTS):
             console.warn("no primary port answered, sweeping every published WARP port")
-            found = scanner.discover_ports(sampled, list(ALL_PORTS), sample=6)
+            found = scanner.discover_ports(sampled, list(ALL_PORTS), sample=12)
         if found:
             ports = found[:3]
             console.ok(f"reachable ports on this network: {', '.join(str(p) for p in ports)}")
@@ -195,89 +291,74 @@ def _collect_targets(console: Console, args: argparse.Namespace, scanner: Scanne
             console.warn("port discovery found nothing; scanning the primary ports anyway")
             ports = list(PRIMARY_PORTS[:2])
 
-    return build_endpoints(sampled, ports)
+    targets = build_endpoints(sampled, ports)
+
+    # Anything this network is already known to like goes in the pot too. It
+    # costs a handful of extra probes and it is where the winners usually come
+    # from on a network that has been scanned before.
+    if profile is not None:
+        remembered = [Endpoint.parse(item) for item in operator_mod.seed_endpoints(profile, limit=24)]
+        extra = [e for e in remembered if e not in set(targets) and e.is_ipv6 == args.ipv6]
+        if extra:
+            console.info(f"adding {len(extra)} endpoint(s) remembered for {profile.operator}")
+            targets = extra + targets
+    return targets
+
+
+# -- commands ---------------------------------------------------------------
 
 
 def cmd_scan(args: argparse.Namespace, console: Console) -> int:
     _apply_presets(args)
-    config = ScanConfig(
-        probes=args.probes,
-        timeout=args.timeout,
-        rate=args.rate,
-        max_inflight=args.max_inflight,
-        source_ip=args.source_ip,
-        ipv6=args.ipv6,
-    )
+    obfuscation = _obfuscation(args)
+    identity = _identity(args, console)
+    profile = _network(args, console)
+
     progress = Progress(console)
     scanner = Scanner(
-        static=_static_key(console),
-        responder_public=_decode_key(args.peer_key),
-        config=config,
+        identity=identity,
+        config=_scan_config(args, obfuscation),
         progress=progress.hook,
     )
 
-    targets = _collect_targets(console, args, scanner)
+    control_ok, control_detail = True, "skipped"
+    if not args.no_preflight:
+        control_ok, control_detail = scanner.preflight()
+        progress.clear()
+        (console.ok if control_ok else console.warn)(control_detail)
+
+    targets = _collect_targets(console, args, scanner, profile)
     if not targets:
         console.error("no targets to scan")
         return EXIT_USAGE
-    console.info(f"probing {len(targets)} endpoints with {args.probes} real WireGuard handshakes each")
-
-    started = time.perf_counter()
-    results = scanner.scan(targets)
-    progress.clear()
-    elapsed = time.perf_counter() - started
-
-    alive = [r for r in results if r.alive]
-    responsive = [r for r in results if r.rtts]
-    console.write()
-    console.table(results, limit=args.top)
-    console.write()
     console.info(
-        f"{len(alive)} of {len(targets)} endpoints answered in {elapsed:.1f}s "
-        f"({sum(r.sent for r in results)} handshakes sent)"
+        f"probing {len(targets)} endpoints with real WireGuard handshakes "
+        f"({obfuscation.summary()})"
     )
 
-    if not responsive:
-        console.warn("nothing usable found: try --deep, another network, or -6 for IPv6")
-        _write_exports(args, console, results, None)
+    report = scanner.hunt(targets, obfuscate_confirm=not args.no_awg)
+    progress.clear()
+    report.control_ok, report.control_detail = control_ok, control_detail
+    report.network = profile.as_dict() if profile else None
+
+    console.write()
+    console.table(report.results, limit=args.top)
+    console.verdict(report)
+
+    if profile is not None and report.responsive:
+        operator_mod.remember(profile, exporters.memory_entries(report.results))
+
+    _write_exports(args, console, report)
+
+    if not report.responsive:
+        console.warn("run 'warpep doctor' - it will tell you which of the identity, "
+                     "network, family, port or transport is at fault")
         return EXIT_NOTHING_FOUND
-
-    best = responsive[0]
-    console.ok(
-        f"best endpoint: {console.paint(str(best.endpoint), 'bold')} "
-        f"({best.avg:.1f} ms avg, {best.loss:.0f}% loss, {best.jitter:.1f} ms jitter)"
-    )
-
-    if getattr(args, "verify", 0):
-        console.write()
-        console.info("deep verification: pushing real traffic through the winners")
-        static = _static_key(console)
-        for result in responsive[: args.verify]:
-            check = verify_endpoint(
-                static,
-                result.endpoint,
-                responder_public=_decode_key(args.peer_key),
-                client_ip=_client_ip(),
-                echoes=2,
-                timeout=max(2.0, args.timeout * 2),
-            )
-            console.tunnel(check)
-
-    _write_exports(args, console, results, best)
     return EXIT_OK
 
 
-def _client_ip() -> str:
-    cached = account_mod.load_account()
-    return cached.address_v4 if cached and cached.address_v4 else "172.16.0.2"
-
-
-def _write_exports(
-    args: argparse.Namespace,
-    console: Console,
-    results: Sequence[EndpointResult],
-    best: Optional[EndpointResult],
-) -> None:
+def _write_exports(args: argparse.Namespace, console: Console, report: ScanReport) -> None:
+    results = report.results
     meta = {
         "probes_per_endpoint": args.probes,
         "timeout_seconds": args.timeout,
@@ -286,37 +367,42 @@ def _write_exports(
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     if getattr(args, "json", None):
-        _write(args.json, exporters.results_json(results, meta), console)
+        _write(args.json, exporters.results_json(results, meta, report=report), console)
     if getattr(args, "csv", None):
         _write(args.csv, exporters.results_csv(results), console)
     if getattr(args, "out", None):
         _write(args.out, exporters.warp_links(results, limit=max(1, args.top)), console)
-    if best and (getattr(args, "conf", None) or getattr(args, "singbox", None)):
-        account = _account_for_export(console, no_register=False)
-        if getattr(args, "conf", None):
-            _write(
-                args.conf,
-                exporters.wireguard_conf(
-                    best.endpoint,
-                    private_key=account.private_key,
-                    address_v4=account.address_v4,
-                    address_v6=account.address_v6,
-                    peer_public_key=account.peer_public_key,
-                ),
-                console,
-            )
-        if getattr(args, "singbox", None):
-            _write(
-                args.singbox,
-                exporters.singbox_outbound(
-                    best.endpoint,
-                    private_key=account.private_key,
-                    address_v4=account.address_v4,
-                    address_v6=account.address_v6,
-                    peer_public_key=account.peer_public_key,
-                ),
-                console,
-            )
+    if getattr(args, "links", None):
+        _write(args.links, exporters.warp_uri_list(results, limit=max(1, args.top)), console)
+
+    best = report.best
+    wants_conf = any(getattr(args, name, None) for name in ("conf", "awg_conf", "singbox"))
+    if not (best and wants_conf):
+        return
+    account = _account_for_export(console, no_register=False)
+    note = "tunnel VERIFIED by WarpEP" if best.verified else f"health {best.health}/100, not tunnel-verified"
+    shared = dict(
+        private_key=account.private_key,
+        address_v4=account.address_v4,
+        address_v6=account.address_v6,
+        peer_public_key=account.peer_public_key,
+    )
+    if getattr(args, "conf", None):
+        _write(args.conf, exporters.wireguard_conf(best.endpoint, note=note, **shared), console)
+    if getattr(args, "awg_conf", None):
+        profile = report_obfuscation_profile(args)
+        _write(
+            args.awg_conf,
+            exporters.wireguard_conf(best.endpoint, obfuscation=profile, note=note, **shared),
+            console,
+        )
+    if getattr(args, "singbox", None):
+        _write(args.singbox, exporters.singbox_outbound(best.endpoint, **shared), console)
+
+
+def report_obfuscation_profile(args: argparse.Namespace) -> ObfuscationProfile:
+    profile = _obfuscation(args)
+    return profile if profile.active else awg_profile()
 
 
 def _write(path: str, content: str, console: Console) -> None:
@@ -338,91 +424,138 @@ def _account_for_export(console: Console, no_register: bool) -> account_mod.Warp
             return account
         except account_mod.AccountError as exc:
             console.warn(f"WARP registration unavailable ({exc}); emitting a local key instead")
-    keypair = Keypair.generate()
+    identity = resolve_identity()
     return account_mod.WarpAccount(
-        private_key=keypair.private_b64,
-        public_key=keypair.public_b64,
-        peer_public_key=WARP_PUBLIC_KEY_B64,
-        address_v4="172.16.0.2",
-        address_v6="",
+        private_key=identity.keypair.private_b64,
+        public_key=identity.keypair.public_b64,
+        peer_public_key=WARP_RESPONDER_PUBLIC_KEY_B64,
+        address_v4=identity.client_ip,
+        address_v6=identity.client_ip_v6,
     )
+
+
+def cmd_masque(args: argparse.Namespace, console: Console) -> int:
+    transports = ["masque-h2", "masque-h3"] if args.transport == "both" else [args.transport]
+    ports = parse_ports(args.ports) if args.ports else list(masque.MASQUE_PORTS)
+    progress = Progress(console)
+    collected: List[masque.MasqueResult] = []
+    for transport in transports:
+        targets = masque.default_targets(transport, ipv6=args.ipv6, ports=ports)
+        if args.sample and len(targets) > args.sample:
+            targets = targets[: args.sample]
+        console.info(f"probing {len(targets)} {transport} endpoint(s) with SNI {args.sni}")
+        results = masque.scan(
+            targets,
+            transport=transport,
+            timeout=args.timeout,
+            attempts=args.attempts,
+            workers=args.workers,
+            sni=args.sni,
+            progress=progress.hook,
+        )
+        progress.clear()
+        console.write()
+        console.masque_table(results, limit=args.top)
+        collected.extend(results)
+
+    alive = [r for r in collected if r.alive]
+    if args.json:
+        import json
+
+        _write(
+            args.json,
+            json.dumps({"tool": BRAND, "version": __version__, "results": [r.as_dict() for r in collected]}, indent=2) + "\n",
+            console,
+        )
+    if args.out:
+        _write(args.out, "\n".join(str(r.endpoint) for r in alive[: args.top]) + ("\n" if alive else ""), console)
+    if not alive:
+        console.warn("no MASQUE endpoint answered on this network")
+        return EXIT_NOTHING_FOUND
+    best = alive[0]
+    console.ok(
+        f"best MASQUE endpoint: {console.paint(str(best.endpoint), 'bold')} "
+        f"({best.transport}, {best.avg:.0f} ms). Feed it to usque or another MASQUE client."
+    )
+    return EXIT_OK
 
 
 def cmd_verify(args: argparse.Namespace, console: Console) -> int:
     endpoint = Endpoint.parse(args.endpoint)
+    identity = resolve_identity(private_key=args.key)
+    console.identity_card(identity)
+    if identity.source != "account":
+        console.warn(
+            "no WARP registration cached: the handshake will succeed but the inner IP is not "
+            "yours, so a tunnel failure here may be the address, not the endpoint. "
+            "Run 'warpep register' for a decisive answer."
+        )
     console.info(f"verifying {endpoint}: handshake, transport keys, then real ICMP through the tunnel")
-    account = account_mod.load_account()
-    static = account.keypair if account else Keypair.generate()
-    if not account:
-        console.warn("no WARP registration cached: run 'warpep register' for a routable tunnel check")
     check = verify_endpoint(
-        static,
+        identity.keypair,
         endpoint,
-        responder_public=_decode_key(args.peer_key),
-        client_ip=account.address_v4 if account else "172.16.0.2",
+        responder_public=decode_public_key(args.peer_key),
+        client_ip=identity.client_ip,
         target_ip=args.target,
         echoes=args.echoes,
         timeout=args.timeout,
+        obfuscation=awg_profile() if args.awg else no_obfuscation(),
     )
     console.tunnel(check)
-    return EXIT_OK if check.ok or check.handshake_ms is not None else EXIT_NOTHING_FOUND
+    return EXIT_OK if check.ok else EXIT_NOTHING_FOUND
 
 
 def cmd_config(args: argparse.Namespace, console: Console) -> int:
+    best: Optional[EndpointResult] = None
     if args.endpoint:
         endpoint = Endpoint.parse(args.endpoint)
     else:
         _apply_presets(args)
-        console.info("no endpoint given: scanning for the fastest one first")
+        console.info("no endpoint given: scanning for the fastest healthy one first")
+        obfuscation = _obfuscation(args)
+        identity = _identity(args, console)
+        profile = _network(args, console)
         progress = Progress(console)
-        scanner = Scanner(
-            static=_static_key(console),
-            responder_public=_decode_key(args.peer_key),
-            config=ScanConfig(
-                probes=args.probes,
-                timeout=args.timeout,
-                rate=args.rate,
-                max_inflight=args.max_inflight,
-                source_ip=args.source_ip,
-                ipv6=args.ipv6,
-            ),
-            progress=progress.hook,
+        scanner = Scanner(identity=identity, config=_scan_config(args, obfuscation), progress=progress.hook)
+        report = scanner.hunt(
+            _collect_targets(console, args, scanner, profile),
+            obfuscate_confirm=not args.no_awg,
         )
-        results = scanner.scan(_collect_targets(console, args, scanner))
         progress.clear()
-        responsive = [r for r in results if r.rtts]
-        if not responsive:
+        best = report.best
+        if best is None:
             console.error("no endpoint answered, cannot build a config")
             return EXIT_NOTHING_FOUND
-        endpoint = responsive[0].endpoint
-        console.ok(f"using {endpoint} ({responsive[0].avg:.1f} ms)")
+        endpoint = best.endpoint
+        console.ok(f"using {endpoint} (health {best.health}/100, {best.badge})")
 
     account = _account_for_export(console, no_register=args.no_register)
+    note = "" if best is None else (
+        "tunnel VERIFIED by WarpEP" if best.verified else f"health {best.health}/100, not tunnel-verified"
+    )
+    shared = dict(
+        private_key=account.private_key,
+        address_v4=account.address_v4,
+        address_v6=account.address_v6,
+        peer_public_key=account.peer_public_key,
+        mtu=args.mtu,
+    )
     if args.format == "wireguard":
-        content = exporters.wireguard_conf(
-            endpoint,
-            private_key=account.private_key,
-            address_v4=account.address_v4,
-            address_v6=account.address_v6,
-            peer_public_key=account.peer_public_key,
-            mtu=args.mtu,
-        )
+        content = exporters.wireguard_conf(endpoint, note=note, **shared)
+    elif args.format == "amneziawg":
+        content = exporters.wireguard_conf(endpoint, obfuscation=report_obfuscation_profile(args), note=note, **shared)
     elif args.format == "singbox":
-        content = exporters.singbox_outbound(
-            endpoint,
-            private_key=account.private_key,
-            address_v4=account.address_v4,
-            address_v6=account.address_v6,
-            peer_public_key=account.peer_public_key,
-            mtu=args.mtu,
-        )
+        shared.pop("mtu")
+        content = exporters.singbox_outbound(endpoint, mtu=args.mtu, **shared)
+    elif args.format == "warp":
+        content = f"warp://{endpoint}/?ifp=5-10#WarpEP\n"
     else:
         content = f"{endpoint}\n"
 
     if args.out:
         _write(args.out, content, console)
     else:
-        console.stream.write(content)
+        console.say(content.rstrip("\n"))
     return EXIT_OK
 
 
@@ -431,33 +564,77 @@ def cmd_register(args: argparse.Namespace, console: Console) -> int:
         account = account_mod.ensure_account(refresh=args.refresh, timeout=args.timeout)
     except account_mod.AccountError as exc:
         console.error(str(exc))
+        console.warn(
+            "the WARP API looks blocked from here. Scanning still works: WarpEP falls back to "
+            "its bundled enrolled identity, which is enough to probe endpoints."
+        )
         return EXIT_NOTHING_FOUND
     path = account_mod.save_account(account)
-    console.ok("WARP registration ready")
-    console.write(f"  client address : {account.address_v4}" + (f" / {account.address_v6}" if account.address_v6 else ""))
-    console.write(f"  public key     : {account.public_key}")
-    console.write(f"  peer key       : {account.peer_public_key}")
-    console.write(f"  license        : {account.license or '-'}")
-    console.write(f"  saved to       : {path}")
+    console.panel(
+        "WARP REGISTRATION READY",
+        [
+            ("client address", account.address_v4 + (f" / {account.address_v6}" if account.address_v6 else "")),
+            ("public key", account.public_key),
+            ("peer key", account.peer_public_key),
+            ("license", account.license or "-"),
+            ("saved to", str(path)),
+        ],
+        "bright_green",
+    )
+    return EXIT_OK
+
+
+def cmd_operators(args: argparse.Namespace, console: Console) -> int:
+    profile = operator_mod.detect()
+    console.network_card(profile)
+    if args.forget:
+        if operator_mod.forget(profile):
+            console.ok(f"forgot everything learned about {profile.operator}")
+        else:
+            console.warn("nothing remembered for this network")
+        return EXIT_OK
+
+    networks = operator_mod.all_networks()
+    if args.json:
+        import json
+
+        console.say(json.dumps(networks, indent=2, ensure_ascii=False))
+        return EXIT_OK
+    if not networks:
+        console.warn("no network memory yet: run a scan and WarpEP starts learning")
+        return EXIT_NOTHING_FOUND
+    for entry in networks:
+        network = entry.get("network", {})
+        endpoints = entry.get("endpoints", [])
+        title = f"{network.get('operator', 'unknown')}  AS{network.get('asn', 0)}"
+        rows = []
+        for item in endpoints[:8]:
+            badge = "VERIFIED" if item.get("verified") else f"health {item.get('health', '?')}"
+            avg = item.get("avg_ms")
+            rows.append((item.get("endpoint", "?"), f"{avg if avg is not None else '-'} ms   {badge}"))
+        if not rows:
+            rows = [("(empty)", "")]
+        console.panel(title, rows, "bright_cyan")
+    console.info("these are re-probed automatically at the start of every scan on that network")
     return EXIT_OK
 
 
 def cmd_version(console: Console) -> int:
-    console.write(f"{BRAND} {__version__}")
-    console.write(f"python {sys.version.split()[0]} on {sys.platform}")
-    console.write(f"zero dependencies, real WireGuard handshakes")
-    console.write(REPO)
+    console.say(f"{BRAND} {__version__}")
+    console.say(f"python {sys.version.split()[0]} on {sys.platform}")
+    console.say("zero dependencies, real WireGuard handshakes, real MASQUE probes")
+    console.say(REPO)
     return EXIT_OK
 
 
-COMMANDS = ("scan", "verify", "config", "register", "selftest", "version")
-_GLOBAL_FLAGS = {"--no-color", "-q", "--quiet"}
+# -- entry point ------------------------------------------------------------
 
 
 def _normalise_argv(argv: Sequence[str]) -> "tuple[List[str], bool, bool]":
-    """Let global flags appear anywhere and make `scan` the default command.
+    """Let global flags appear anywhere, and pick a sensible default command.
 
-    ``warpep -q scan``, ``warpep scan -q`` and ``warpep --fast -q`` all work.
+    ``warpep`` on a terminal opens the panel, because that is what a human wants.
+    ``warpep | tee log`` scans, because that is what a script wants.
     """
     argv = list(argv)
     no_color = "--no-color" in argv
@@ -465,7 +642,8 @@ def _normalise_argv(argv: Sequence[str]) -> "tuple[List[str], bool, bool]":
     argv = [item for item in argv if item not in _GLOBAL_FLAGS]
     asks_for_help = any(item in {"-h", "--help", "-V", "--version"} for item in argv)
     if not asks_for_help and (not argv or argv[0] not in COMMANDS):
-        argv = ["scan"] + argv
+        interactive = not argv and sys.stdin.isatty() and sys.stdout.isatty()
+        argv = (["panel"] if interactive else ["scan"]) + argv
     return argv, no_color, quiet
 
 
@@ -479,9 +657,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return cmd_version(console)
 
     try:
+        if args.command == "panel":
+            from .panel import run as run_panel
+
+            return run_panel(console)
         if args.command == "selftest":
             console.banner()
             return selftest.run(console)
+        if args.command == "doctor":
+            console.banner()
+            return doctor_mod.run(console)
+        if args.command == "operators":
+            console.banner()
+            return cmd_operators(args, console)
+        if args.command == "masque":
+            console.banner()
+            return cmd_masque(args, console)
         if args.command == "verify":
             console.banner()
             return cmd_verify(args, console)
@@ -496,6 +687,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         console.write()
         console.warn("interrupted")
         return EXIT_INTERRUPTED
+    except (IdentityError, ObfuscationError) as exc:
+        console.error(str(exc))
+        return EXIT_USAGE
     except ValueError as exc:
         console.error(str(exc))
         return EXIT_USAGE
