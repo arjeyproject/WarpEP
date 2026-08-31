@@ -4,21 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "warpep"
-version = "1.0.0"
-description = "WarpEP by ArJey - a real Cloudflare WARP endpoint scanner with zero dependencies"
+version = "2.0.0"
+description = "WarpEP by ArJey - a real Cloudflare WARP endpoint scanner and panel, with zero dependencies"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
 authors = [{ name = "ArJey" }]
-keywords = ["cloudflare", "warp", "wireguard", "scanner", "endpoint", "vpn", "noise", "termux"]
+keywords = ["cloudflare", "warp", "wireguard", "amneziawg", "masque", "quic", "scanner", "endpoint", "vpn", "termux"]
 classifiers = [
   "Development Status :: 5 - Production/Stable",
   "Environment :: Console",
-  "Intended Audience :: System Administrators",
+  "Intended Audience :: End Users/Desktop",
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3 :: Only",
   "Topic :: Internet",
   "Topic :: System :: Networking",
 ]
@@ -37,3 +36,7 @@ packages = ["warpep", "warpep.wireguard"]
 
 [tool.setuptools.package-data]
 warpep = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
