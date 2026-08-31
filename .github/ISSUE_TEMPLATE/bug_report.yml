@@ -1,0 +1,51 @@
+name: Bug report
+description: Something in WarpEP does not work
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: WarpEP version
+      description: output of `warpep --version`
+      placeholder: WarpEP by ArJey 1.0.0
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Android (Termux)
+        - Windows (CMD/PowerShell)
+        - Linux
+        - macOS
+        - Docker / CI
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command you ran
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: selftest
+    attributes:
+      label: Output of `warpep selftest`
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected versus what happened
+    validations:
+      required: true
+  - type: checkboxes
+    id: secrets
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have not pasted any private key or the contents of account.json
+          required: true

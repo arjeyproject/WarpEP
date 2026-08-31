@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Installation guides
+    url: https://github.com/arjeyproject/WarpEP#installation
+    about: One-line install for Termux, Windows, Linux and macOS
+  - name: How the engine works
+    url: https://github.com/arjeyproject/WarpEP/blob/main/docs/HOW_IT_WORKS.md
+    about: Protocol deep dive before asking about measurement details
