@@ -194,7 +194,7 @@ Files live in `~/.config/warpep` (`%APPDATA%\WarpEP` on Windows), override with
 
 ## Credit
 
-Inspired by [vernette/warpscout](https://github.com/vernette/warpscout), whose research
+Inspired by ArJeyProject, whose research
 into the WARP address space, the MASQUE pools and AmneziaWG shaping made this possible.
 WarpEP is an independent pure-Python implementation with its own panel.
 
